@@ -1,0 +1,564 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>メニュー料理の写真を探す</title>
+  </head>
+  <body>
+
+    <nav aria-label="システム切り替え">
+      <a href="index.html">システム一覧</a> |
+      <a href="people.html">人物ごとに仕分け</a>
+    </nav>
+    <main>
+      <h1>メニュー料理の写真を探す</h1>
+      <p>メニューを撮影または選択すると、料理名を読み取って料理の参考写真を探します。</p>
+
+      <label>
+        メニュー写真を選ぶ
+        <input id="menu-file" type="file" accept="image/*" />
+      </label>
+      <button id="camera-open" type="button">カメラを開く</button>
+      <div>
+        <video id="camera" autoplay muted playsinline hidden style="max-width: 100%; height: auto"></video>
+        <button id="camera-capture" type="button" disabled>撮影する</button>
+        <button id="camera-close" type="button" disabled>カメラを閉じる</button>
+      </div>
+
+      <div id="photo-area" hidden>
+        <h2>メニュー写真</h2>
+        <img id="menu-preview" alt="選択したメニュー" style="max-width: 100%; height: auto" />
+        <p id="photo-name"></p>
+        <button id="read-menu" type="button">料理名を読み取る</button>
+        <button id="clear" type="button">写真を消す</button>
+      </div>
+
+      <p id="status" role="status" aria-live="polite">メニュー写真を選んでください。</p>
+      <p>写真の読み取りは端末内で行います。料理名は写真検索のためWikimedia Commonsへ送信されます。検索写真は参考例で、店の料理と同じとは限りません。</p>
+      <p>OCRモデル: <a href="https://huggingface.co/lbm364dl/PaddleOCR-VL-1.5-ONNX" target="_blank" rel="noopener noreferrer">PaddleOCR-VL 1.5 ONNX</a>（Apache-2.0）</p>
+
+      <section id="menu-section" hidden>
+        <h2>読み取った料理</h2>
+        <p>読み取り結果を直したり、料理名を追加・削除できます。</p>
+        <button id="search-all" type="button">すべての料理の写真を探す</button>
+        <button id="add-item" type="button">料理名を追加</button>
+        <ol id="menu-items"></ol>
+      </section>
+
+      <details>
+        <summary>読み取った文字</summary>
+        <pre id="ocr-text"></pre>
+      </details>
+    </main>
+
+    <script type="module">
+      import { env, pipeline, RawImage } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.0";
+
+      env.allowLocalModels = false;
+      env.useBrowserCache = true;
+
+      const OCR_MODEL_ID = "lbm364dl/PaddleOCR-VL-1.5-ONNX";
+      const MAX_IMAGE_SIDE = 2000;
+      const IMAGE_API = "https://commons.wikimedia.org/w/api.php";
+      const fileInput = document.querySelector("#menu-file");
+      const camera = document.querySelector("#camera");
+      const cameraOpenButton = document.querySelector("#camera-open");
+      const cameraCaptureButton = document.querySelector("#camera-capture");
+      const cameraCloseButton = document.querySelector("#camera-close");
+      const photoArea = document.querySelector("#photo-area");
+      const preview = document.querySelector("#menu-preview");
+      const photoName = document.querySelector("#photo-name");
+      const readButton = document.querySelector("#read-menu");
+      const clearButton = document.querySelector("#clear");
+      const searchAllButton = document.querySelector("#search-all");
+      const addItemButton = document.querySelector("#add-item");
+      const status = document.querySelector("#status");
+      const menuSection = document.querySelector("#menu-section");
+      const menuItemsElement = document.querySelector("#menu-items");
+      const ocrTextElement = document.querySelector("#ocr-text");
+
+      let currentPhoto = null;
+      let cameraStream = null;
+      let ocrPipeline = null;
+      let menuItems = [];
+      let nextItemId = 1;
+      let busy = false;
+      const objectUrls = new Set();
+
+      async function requireWebGPU() {
+        if (!navigator.gpu) {
+          throw new Error("このブラウザーではWebGPUを利用できません。");
+        }
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) throw new Error("WebGPU adapterを取得できませんでした。");
+      }
+
+      function updateControls() {
+        fileInput.disabled = busy;
+        cameraOpenButton.disabled = busy || Boolean(cameraStream);
+        cameraCaptureButton.disabled = busy || !cameraStream;
+        cameraCloseButton.disabled = busy || !cameraStream;
+        readButton.disabled = busy || !currentPhoto;
+        clearButton.disabled = busy || !currentPhoto;
+        searchAllButton.disabled = busy || !menuItems.some((item) => item.query.trim());
+        addItemButton.disabled = busy;
+        for (const item of menuItems) {
+          const input = menuItemsElement.querySelector(`[data-query-id="${item.id}"]`);
+          const searchButton = menuItemsElement.querySelector(`[data-action="search"][data-item-id="${item.id}"]`);
+          const removeButton = menuItemsElement.querySelector(`[data-action="remove"][data-item-id="${item.id}"]`);
+          if (input) input.disabled = busy;
+          if (searchButton) searchButton.disabled = busy || item.loading || !item.query.trim();
+          if (removeButton) removeButton.disabled = busy;
+        }
+      }
+
+      function runExclusive(task) {
+        if (busy) return Promise.resolve();
+        busy = true;
+        updateControls();
+        return Promise.resolve()
+          .then(task)
+          .catch((error) => {
+            console.error(error);
+            status.textContent = `エラー: ${error instanceof Error ? error.message : String(error)}`;
+          })
+          .finally(() => {
+            busy = false;
+            updateControls();
+          });
+      }
+
+      function stopCamera() {
+        if (cameraStream) {
+          for (const track of cameraStream.getTracks()) track.stop();
+          cameraStream = null;
+        }
+        camera.srcObject = null;
+        camera.hidden = true;
+        updateControls();
+      }
+
+      function revokeObjectUrl(url) {
+        if (!url) return;
+        URL.revokeObjectURL(url);
+        objectUrls.delete(url);
+      }
+
+      function clearMenuItems() {
+        menuItems = [];
+        menuItemsElement.replaceChildren();
+        menuSection.hidden = true;
+        ocrTextElement.textContent = "";
+      }
+
+      function clearPhoto() {
+        stopCamera();
+        if (currentPhoto) revokeObjectUrl(currentPhoto.previewUrl);
+        currentPhoto = null;
+        preview.removeAttribute("src");
+        photoName.textContent = "";
+        photoArea.hidden = true;
+        clearMenuItems();
+        status.textContent = "メニュー写真を選んでください。";
+        updateControls();
+      }
+
+      async function resizeImage(blob, name) {
+        const bitmap = await createImageBitmap(blob);
+        let canvas;
+        try {
+          const scale = Math.min(1, MAX_IMAGE_SIDE / Math.max(bitmap.width, bitmap.height));
+          canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+          canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+          const context = canvas.getContext("2d");
+          if (!context) throw new Error("写真を処理するCanvasを作成できません。");
+          context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+          const resized = await new Promise((resolve, reject) => {
+            canvas.toBlob(
+              (value) => value ? resolve(value) : reject(new Error("写真を保存できませんでした。")),
+              "image/jpeg",
+              0.92,
+            );
+          });
+          const previewUrl = URL.createObjectURL(resized);
+          objectUrls.add(previewUrl);
+          return { name, blob: resized, previewUrl };
+        } finally {
+          bitmap.close();
+          if (canvas) {
+            canvas.width = 0;
+            canvas.height = 0;
+          }
+        }
+      }
+
+      async function setPhoto(blob, name) {
+        const nextPhoto = await resizeImage(blob, name);
+        if (currentPhoto) revokeObjectUrl(currentPhoto.previewUrl);
+        currentPhoto = nextPhoto;
+        preview.src = currentPhoto.previewUrl;
+        photoName.textContent = currentPhoto.name;
+        photoArea.hidden = false;
+        clearMenuItems();
+        status.textContent = "写真を読み取る準備ができました。";
+        updateControls();
+      }
+
+      async function ensureOcr() {
+        if (ocrPipeline) return ocrPipeline;
+        await requireWebGPU();
+        status.textContent = "OCRモデルを読み込んでいます。初回は約1GBのダウンロードが必要です。";
+        ocrPipeline = await pipeline("image-to-text", OCR_MODEL_ID, {
+          device: "webgpu",
+          progress_callback(progress) {
+            if (progress.status === "progress" && Number.isFinite(progress.progress)) {
+              const file = progress.file ? `: ${progress.file}` : "";
+              status.textContent = `OCRモデルをダウンロードしています: ${progress.progress.toFixed(0)}%${file}`;
+            }
+          },
+        });
+        return ocrPipeline;
+      }
+
+      function outputToText(output) {
+        if (typeof output === "string") return output;
+        if (Array.isArray(output)) {
+          return output.map((entry) => entry?.generated_text ?? entry?.text ?? "").join("\n");
+        }
+        return output?.generated_text ?? output?.text ?? "";
+      }
+
+      function isPriceOnly(value) {
+        return /^(?:[$€£₹]\s*)?\d[\d.,]*(?:\s*[$€£₹])?$/.test(value.trim());
+      }
+
+      function cleanOcrLine(value) {
+        return value
+          .replace(/<\|[^|]+\|>/g, " ")
+          .replace(/<[^>]*>/g, " ")
+          .replace(/^\s*(?:[-*•]|\d+[.)])\s*/, "")
+          .replace(/^#+\s*/, "")
+          .replace(/\s+/g, " ")
+          .replace(/^[|\s]+|[|\s]+$/g, "")
+          .trim();
+      }
+
+      function parseMenuItems(text) {
+        const candidates = [];
+        for (const sourceLine of text.split(/\r?\n/)) {
+          const line = sourceLine.trim();
+          if (!line || /^[-| :]+$/.test(line)) continue;
+          let parts = line.includes("|")
+            ? line.split("|").map(cleanOcrLine).filter(Boolean)
+            : line.split(/\t+/).map(cleanOcrLine).filter(Boolean);
+          if (parts.length > 1) {
+            if (/^(?:dish|item|menu|name|料理|品名|菜品)$/i.test(parts[0])) continue;
+            parts = parts.filter((part) => !isPriceOnly(part));
+            parts = parts.slice(0, 2);
+          } else {
+            parts = [cleanOcrLine(line)];
+            parts[0] = parts[0].replace(/\s+(?:[$€£₹]\s*)?\d[\d.,]*(?:\s*[$€£₹])?\s*$/, "").trim();
+          }
+          const candidate = parts.filter(Boolean).join(" — ");
+          if (!candidate || isPriceOnly(candidate) || candidate.length < 2) continue;
+          if (/^(?:menu|lunch|dinner|breakfast|appetizer|dessert|price|料理|メニュー)$/i.test(candidate)) continue;
+          if (!candidates.some((item) => item.toLocaleLowerCase() === candidate.toLocaleLowerCase())) {
+            candidates.push(candidate);
+          }
+        }
+        return candidates;
+      }
+
+      function makeItem(query) {
+        return { id: nextItemId++, query, results: [], error: "", loading: false };
+      }
+
+      function addMenuItem(query = "") {
+        const item = makeItem(query);
+        menuItems.push(item);
+        menuSection.hidden = false;
+        renderMenuItems();
+        const input = menuItemsElement.querySelector(`[data-query-id="${item.id}"]`);
+        input?.focus();
+        updateControls();
+      }
+
+      function makeText(tag, text) {
+        const element = document.createElement(tag);
+        element.textContent = text;
+        return element;
+      }
+
+      function makeImageResult(result) {
+        const article = document.createElement("article");
+        const link = document.createElement("a");
+        link.href = result.pageUrl;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+
+        const image = document.createElement("img");
+        image.src = result.thumbUrl;
+        image.alt = result.title;
+        image.loading = "lazy";
+        image.style.maxWidth = "240px";
+        image.style.height = "auto";
+        link.append(image);
+        article.append(link, makeText("p", result.title));
+
+        const attribution = document.createElement("p");
+        const credit = [result.artist, result.license].filter(Boolean).join(" · ");
+        attribution.textContent = credit || "作者・ライセンス情報はリンク先を確認してください。";
+        article.append(attribution);
+        return article;
+      }
+
+      function renderMenuItems() {
+        menuItemsElement.replaceChildren();
+        for (const item of menuItems) {
+          const row = document.createElement("li");
+          const input = document.createElement("input");
+          input.type = "text";
+          input.value = item.query;
+          input.dataset.queryId = String(item.id);
+          input.setAttribute("aria-label", "料理名または写真検索語");
+
+          const searchButton = document.createElement("button");
+          searchButton.type = "button";
+          searchButton.dataset.action = "search";
+          searchButton.dataset.itemId = String(item.id);
+          searchButton.textContent = item.loading ? "検索中…" : "写真を探す";
+          searchButton.disabled = busy || item.loading || !item.query.trim();
+
+          const removeButton = document.createElement("button");
+          removeButton.type = "button";
+          removeButton.dataset.action = "remove";
+          removeButton.dataset.itemId = String(item.id);
+          removeButton.textContent = "削除";
+          removeButton.disabled = busy;
+
+          row.append(input, searchButton, removeButton);
+          if (item.error) row.append(makeText("p", item.error));
+          if (item.results.length) {
+            const results = document.createElement("div");
+            for (const result of item.results) results.append(makeImageResult(result));
+            row.append(results);
+          }
+          menuItemsElement.append(row);
+        }
+        updateControls();
+      }
+
+      function htmlToText(value) {
+        if (!value) return "";
+        const parsed = new DOMParser().parseFromString(String(value), "text/html");
+        return (parsed.body.textContent ?? "").replace(/\s+/g, " ").trim();
+      }
+
+      async function searchCommons(query) {
+        const params = new URLSearchParams({
+          action: "query",
+          generator: "search",
+          gsrsearch: `filetype:bitmap ${query} food`,
+          gsrnamespace: "6",
+          gsrlimit: "3",
+          prop: "imageinfo",
+          iiprop: "url|extmetadata",
+          iiurlwidth: "480",
+          format: "json",
+          origin: "*",
+        });
+        const response = await fetch(`${IMAGE_API}?${params}`);
+        if (!response.ok) throw new Error(`写真検索に失敗しました (HTTP ${response.status})`);
+        const data = await response.json();
+        return Object.values(data.query?.pages ?? {})
+          .map((page) => {
+            const info = page.imageinfo?.[0];
+            if (!info?.thumburl || !info.descriptionurl || !/^image\/(?:jpeg|png|webp|gif)$/i.test(info.thumbmime ?? info.mime ?? "")) return null;
+            const metadata = info.extmetadata ?? {};
+            return {
+              title: page.title.replace(/^File:/, ""),
+              thumbUrl: info.thumburl,
+              pageUrl: info.descriptionurl,
+              artist: htmlToText(metadata.Artist?.value || metadata.Credit?.value || ""),
+              license: htmlToText(metadata.LicenseShortName?.value || metadata.UsageTerms?.value || ""),
+            };
+          })
+          .filter(Boolean);
+      }
+
+      async function searchItem(item) {
+        const query = item.query.trim();
+        if (!query) throw new Error("料理名を入力してください。");
+        item.loading = true;
+        item.error = "";
+        item.results = [];
+        renderMenuItems();
+        status.textContent = `写真を探しています: ${query}`;
+        try {
+          item.results = await searchCommons(query.slice(0, 140));
+          if (!item.results.length) {
+            item.error = "写真が見つかりませんでした。料理名を英字などに直して再検索してください。";
+          }
+        } catch (error) {
+          item.error = error instanceof Error ? error.message : String(error);
+        } finally {
+          item.loading = false;
+          renderMenuItems();
+        }
+      }
+
+      fileInput.addEventListener("change", () => {
+        const file = fileInput.files?.[0];
+        fileInput.value = "";
+        if (!file) return;
+        runExclusive(async () => {
+          stopCamera();
+          status.textContent = "メニュー写真を準備しています。";
+          await setPhoto(file, file.name);
+        });
+      });
+
+      cameraOpenButton.addEventListener("click", () => runExclusive(async () => {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error("カメラを利用できません。HTTPSまたはlocalhostで開いてください。");
+        }
+        status.textContent = "カメラへのアクセスを待っています。";
+        cameraStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" } },
+          audio: false,
+        });
+        camera.srcObject = cameraStream;
+        camera.hidden = false;
+        try {
+          await camera.play();
+          status.textContent = "メニューを映して「撮影する」を押してください。";
+        } catch (error) {
+          stopCamera();
+          throw error;
+        }
+      }));
+
+      cameraCaptureButton.addEventListener("click", () => runExclusive(async () => {
+        if (!cameraStream) throw new Error("先にカメラを開いてください。");
+        if (camera.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !camera.videoWidth) {
+          throw new Error("カメラ映像を準備しています。少し待ってから撮影してください。");
+        }
+        const canvas = document.createElement("canvas");
+        const scale = Math.min(1, MAX_IMAGE_SIDE / Math.max(camera.videoWidth, camera.videoHeight));
+        canvas.width = Math.max(1, Math.round(camera.videoWidth * scale));
+        canvas.height = Math.max(1, Math.round(camera.videoHeight * scale));
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("撮影画像用のCanvasを作成できません。");
+        context.drawImage(camera, 0, 0, canvas.width, canvas.height);
+        try {
+          const blob = await new Promise((resolve, reject) => {
+            canvas.toBlob(
+              (value) => value ? resolve(value) : reject(new Error("撮影画像を保存できませんでした。")),
+              "image/jpeg",
+              0.92,
+            );
+          });
+          status.textContent = "撮影した写真を準備しています。";
+          await setPhoto(blob, "撮影したメニュー");
+        } finally {
+          canvas.width = 0;
+          canvas.height = 0;
+          stopCamera();
+        }
+      }));
+
+      cameraCloseButton.addEventListener("click", () => {
+        stopCamera();
+        status.textContent = "カメラを停止しました。";
+      });
+
+      readButton.addEventListener("click", () => runExclusive(async () => {
+        if (!currentPhoto) throw new Error("先にメニュー写真を選んでください。");
+        const reader = await ensureOcr();
+        status.textContent = "メニューを読み取っています。";
+        const bitmap = await createImageBitmap(currentPhoto.blob);
+        const canvas = document.createElement("canvas");
+        canvas.width = bitmap.width;
+        canvas.height = bitmap.height;
+        const context = canvas.getContext("2d");
+        if (!context) {
+          bitmap.close();
+          throw new Error("OCR用のCanvasを作成できません。");
+        }
+        context.drawImage(bitmap, 0, 0);
+        bitmap.close();
+        let rawImage;
+        try {
+          rawImage = RawImage.fromCanvas(canvas);
+          const output = await reader(rawImage, { max_new_tokens: 2048 });
+          const text = outputToText(output).trim();
+          ocrTextElement.textContent = text;
+          const lines = parseMenuItems(text);
+          menuItems = lines.map(makeItem);
+          menuSection.hidden = false;
+          renderMenuItems();
+          status.textContent = lines.length
+            ? `${lines.length}件の候補を読み取りました。料理名を確認して写真を探してください。`
+            : "料理名を分けられませんでした。料理名を追加してください。";
+        } finally {
+          rawImage?.dispose?.();
+          canvas.width = 0;
+          canvas.height = 0;
+        }
+      }));
+
+      menuItemsElement.addEventListener("input", (event) => {
+        const input = event.target.closest("[data-query-id]");
+        if (!input) return;
+        const item = menuItems.find((entry) => entry.id === Number(input.dataset.queryId));
+        if (item) {
+          item.query = input.value;
+          item.results = [];
+          item.error = "";
+          const searchButton = input.closest("li")?.querySelector('button[data-action="search"]');
+          if (searchButton) searchButton.disabled = busy || !item.query.trim();
+          input.closest("li")?.querySelector("div")?.remove();
+          input.closest("li")?.querySelector("p")?.remove();
+          updateControls();
+        }
+      });
+
+      menuItemsElement.addEventListener("click", (event) => {
+        const button = event.target.closest("button[data-action]");
+        if (!button) return;
+        const item = menuItems.find((entry) => entry.id === Number(button.dataset.itemId));
+        if (!item) return;
+        if (button.dataset.action === "search") {
+          runExclusive(() => searchItem(item));
+        } else if (button.dataset.action === "remove") {
+          menuItems = menuItems.filter((entry) => entry.id !== item.id);
+          renderMenuItems();
+        }
+      });
+
+      searchAllButton.addEventListener("click", () => runExclusive(async () => {
+        const searchableItems = menuItems.filter((item) => item.query.trim());
+        if (searchableItems.length === 0) throw new Error("写真を探す料理名がありません。");
+        for (let index = 0; index < searchableItems.length; index++) {
+          status.textContent = `料理の写真を探しています: ${index + 1}/${searchableItems.length}`;
+          await searchItem(searchableItems[index]);
+        }
+        status.textContent = "写真検索が終わりました。見つかった写真を確認してください。";
+      }));
+
+      addItemButton.addEventListener("click", () => addMenuItem(""));
+      clearButton.addEventListener("click", clearPhoto);
+
+      window.addEventListener("pagehide", () => {
+        stopCamera();
+        for (const url of objectUrls) URL.revokeObjectURL(url);
+        objectUrls.clear();
+        ocrPipeline?.dispose?.();
+      });
+
+      updateControls();
+    </script>
+  </body>
+</html>
